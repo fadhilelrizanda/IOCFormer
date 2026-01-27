@@ -18,6 +18,9 @@ parser.add_argument('--epochs', type=int, default=5000,
 parser.add_argument('--pre', type=str, default=None,
                     help='pre-trained model directory')
 
+parser.add_argument('--image_path', type=str, default=None,
+                    help='path image')
+
 parser.add_argument('--batch_size', type=int, default=16,
                     help='input batch size for training')
 parser.add_argument('--crop_size', type=int, default=256,
