@@ -172,28 +172,12 @@ def infer_and_save_single_image(model):
     patches = patches.cuda()
 
     outputs = model(patches)
-    real_density_map = None
-    # If model returns [out, out_dm], extract both
-    if isinstance(outputs, list) and len(outputs) == 2:
-        out_dict, out_dm = outputs
-        # out_dm[1] is the predicted density map (mu2), shape: (N, 1, h, w)
-        # Stitch all patch density maps into a full image
-        patch_density_maps = out_dm[1]  # (N, 1, h, w)
-        # Arrange patches into (num_h, num_w, h, w)
-        N, C, h, w = patch_density_maps.shape
-        patch_density_maps = patch_density_maps.view(num_h, num_w, C, h, w)
-        patch_density_maps = patch_density_maps.permute(2, 0, 3, 1, 4).contiguous()  # (C, num_h, h, num_w, w)
-        full_density_map = patch_density_maps.view(C, num_h * h, num_w * w)[0]  # (H, W)
-        # Crop to original padded image size
-        full_density_map = full_density_map[:H, :W]
-        real_density_map = full_density_map.cpu().numpy()
-    else:
-        out_dict = outputs
+    if isinstance(outputs, list):
+        outputs = outputs[0]
+    if not isinstance(outputs, dict):
+        raise RuntimeError(f"Unexpected output type: {type(outputs)}")
 
-    if not isinstance(out_dict, dict):
-        raise RuntimeError(f"Unexpected output type: {type(out_dict)}")
-
-    out_logits, out_point = out_dict["pred_logits"], out_dict["pred_points"]
+    out_logits, out_point = outputs["pred_logits"], outputs["pred_points"]
 
     prob = out_logits.sigmoid()
     topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_queries, dim=1)
@@ -219,8 +203,6 @@ def infer_and_save_single_image(model):
         drawn_vis = drawn_vis[:oh, :ow]
         point_map = point_map[:oh, :ow]
         density_map = density_map[:oh, :ow]
-        if real_density_map is not None:
-            real_density_map = real_density_map[..., :oh, :ow]
 
     out_points_path = os.path.join(out_dir, f"{base}_pred_points.png")
     out_pointmap_path = os.path.join(out_dir, f"{base}_point_map.png")
@@ -229,20 +211,6 @@ def infer_and_save_single_image(model):
     cv2.imwrite(out_points_path, drawn_vis)
     cv2.imwrite(out_pointmap_path, point_map)
     cv2.imwrite(out_density_path, density_map)
-
-    # Save real density map from model if available
-    if real_density_map is not None:
-        dm = real_density_map
-        # Resize to original image size if needed
-        if dm.shape[0] != img_bgr.shape[0] or dm.shape[1] != img_bgr.shape[1]:
-            dm = cv2.resize(dm, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
-        if np.max(dm) > 0:
-            dm = dm / np.max(dm) * 255
-        dm = dm.astype(np.uint8)
-        dm_color = cv2.applyColorMap(dm, 2)
-        out_real_density_path = os.path.join(out_dir, f"{base}_real_density_map.png")
-        cv2.imwrite(out_real_density_path, dm_color)
-        print(" ", out_real_density_path)
 
     print("Saved:")
     print(" ", out_points_path)

@@ -70,7 +70,7 @@ parser.add_argument('--video_path', type=str, default='./video_demo/1.mp4',
                     help='input video path ')
 
 # distributed training parameters
-parser.add_argument('--local_rank', type=int, default=-1,
+parser.add_argument('--local-rank', type=int, default=-1,
                     help='local local_rank')
 
 parser.add_argument('--lr_backbone', default=1e-4, type=float)
