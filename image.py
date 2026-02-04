@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 
 def load_data(img_path, args, train=True):
-    gt_path = img_path.replace('.jpg', '.h5').replace('images', 'gt_detr_map')
+    gt_path = img_path.replace('.png', '.h5').replace('images', 'gt_detr_map')
 
     while True:
         try:
