@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore')
 setup_seed(args.seed)
 
 # model save path, set this path to where you would like to save model/log
-exp_save='/cluster/work/cvl/guosun/models/cod-counting/'
+exp_save='./training_weights/'
 
 def main(args):
     if args['dataset'] == 'jhu':
