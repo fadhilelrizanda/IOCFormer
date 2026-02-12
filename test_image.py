@@ -8,58 +8,54 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from scipy.ndimage import gaussian_filter  # fixed deprecation
+from scipy.ndimage import gaussian_filter
+from PIL import Image
 
 import util.misc as utils
 from config import return_args, args
 from Networks.CDETR import build_model
 
 
-# Keep consistent with demo_video.py
-img_transform = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-to_tensor = transforms.ToTensor()
-
-
-def pad_to_multiple(img_bgr: np.ndarray, multiple: int):
+def pad_to_multiple_pil(img_pil: Image.Image, multiple: int):
     """Pad bottom/right so H,W are multiples of `multiple`."""
-    h, w = img_bgr.shape[:2]
-    pad_h = (multiple - (h % multiple)) % multiple
+    w, h = img_pil.size
     pad_w = (multiple - (w % multiple)) % multiple
+    pad_h = (multiple - (h % multiple)) % multiple
 
     if pad_h == 0 and pad_w == 0:
-        return img_bgr, (0, 0)
+        return img_pil, (0, 0)
 
-    padded = cv2.copyMakeBorder(
-        img_bgr, 0, pad_h, 0, pad_w,
-        borderType=cv2.BORDER_CONSTANT,
-        value=(0, 0, 0)
-    )
+    # Pad on right and bottom
+    new_w = w + pad_w
+    new_h = h + pad_h
+    padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
+    padded.paste(img_pil, (0, 0))
+    
     return padded, (pad_h, pad_w)
 
 
-def split_into_patches(img_bgr: np.ndarray, crop_size: int):
+def split_into_patches_pil(img_pil: Image.Image, crop_size: int, transform):
     """
-    Convert to tensor + normalize, then split into (N,3,crop,crop) patches.
-    Matches demo_video.py’s reshape logic.
+    Convert PIL image to patches, matching the dataloader's logic exactly.
     """
-    img_t = to_tensor(img_bgr)     # (3,H,W), float [0,1]
-    img_t = img_transform(img_t)
-
+    # Apply transform (ToTensor + Normalize) - same as dataloader
+    img_t = transform(img_pil)  # [3, H, W]
+    
     width, height = img_t.shape[2], img_t.shape[1]
     num_w = int(width / crop_size)
     num_h = int(height / crop_size)
-
+    
+    # Match dataset.py patch splitting logic exactly
     img_t = img_t.view(3, num_h, crop_size, width).view(3, num_h, crop_size, num_w, crop_size)
     img_t = img_t.permute(0, 1, 3, 2, 4).contiguous().view(3, num_w * num_h, crop_size, crop_size)
-    patches = img_t.permute(1, 0, 2, 3).contiguous()  # (N,3,crop,crop)
-
+    patches = img_t.permute(1, 0, 2, 3).contiguous()  # [N, 3, crop, crop]
+    
     return patches, num_h, num_w, height, width
 
 
 def show_map(out_pointes, frame_bgr, width, height, crop_size, num_h, num_w, threshold=0.25):
     """
-    Adapted from demo_video.py. Builds a stitched point map and draws points.
+    Builds a stitched point map and draws points.
     out_pointes: (Npatch, 1, Q, 3) with [conf, x, y] in patch coords.
     """
     kpoint_list = []
@@ -72,7 +68,7 @@ def show_map(out_pointes, frame_bgr, width, height, crop_size, num_h, num_w, thr
 
         for j in range(len(out_point)):
             if out_value[j] < threshold:
-                break
+                continue
             x = int(out_point[j][0])
             y = int(out_point[j][1])
             if 0 <= x < crop_size and 0 <= y < crop_size:
@@ -117,8 +113,6 @@ def build_and_load_model():
     model, criterion, postprocessors = build_model(return_args)
     model = model.cuda()
 
-    # Use your gpu_id string style (e.g., "0,1"), but for single inference we typically use first GPU
-    # DataParallel expects list of ints
     gpu_ids = [int(x) for x in str(args.gpu_id).split(",") if x.strip() != ""]
     if len(gpu_ids) == 0:
         gpu_ids = [0]
@@ -151,40 +145,49 @@ def infer_and_save_single_image(model):
     if not args.image_path:
         raise ValueError("You must pass --image_path /path/to/image.jpg")
 
-    # use save_path as output directory
     out_dir = args.save_path
     os.makedirs(out_dir, exist_ok=True)
 
-    img_bgr = cv2.imread(args.image_path)
-    if img_bgr is None:
-        raise ValueError(f"Failed to read image: {args.image_path}")
-
+    # Load image using PIL (same as dataloader and H5 generation)
+    img_pil = Image.open(args.image_path).convert('RGB')
+    
     base = os.path.splitext(os.path.basename(args.image_path))[0]
 
     crop_size = int(args.crop_size)
     threshold = float(args.threshold)
-    num_queries = int(args.num_queries)  # from config.py (default 500)
+    num_queries = int(args.num_queries)
 
-    # pad to multiple of crop_size
-    img_pad, (pad_h, pad_w) = pad_to_multiple(img_bgr, crop_size)
-
-    patches, num_h, num_w, H, W = split_into_patches(img_pad, crop_size)
+    # Pad to multiple of crop_size
+    img_pil_padded, (pad_h, pad_w) = pad_to_multiple_pil(img_pil, crop_size)
+    
+    # Apply the same transforms as the dataloader
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    patches, num_h, num_w, H, W = split_into_patches_pil(img_pil_padded, crop_size, transform)
     patches = patches.cuda()
+    
+    num_patches = patches.shape[0]
+    print(f"\nImage: {img_pil.size} (W x H)")
+    print(f"Padded: {img_pil_padded.size}")
+    print(f"Patches: {num_patches} ({num_h}x{num_w})")
+    print(f"DEBUG: patches.shape = {patches.shape}")
+    print(f"DEBUG: patches min/max = {patches.min():.4f}/{patches.max():.4f}")
 
     outputs = model(patches)
     real_density_map = None
-    # If model returns [out, out_dm], extract both
+    
     if isinstance(outputs, list) and len(outputs) == 2:
         out_dict, out_dm = outputs
-        # out_dm[1] is the predicted density map (mu2), shape: (N, 1, h, w)
-        # Stitch all patch density maps into a full image
-        patch_density_maps = out_dm[1]  # (N, 1, h, w)
-        # Arrange patches into (num_h, num_w, h, w)
+        # Density map processing
+        patch_density_maps = out_dm[1]
         N, C, h, w = patch_density_maps.shape
         patch_density_maps = patch_density_maps.view(num_h, num_w, C, h, w)
-        patch_density_maps = patch_density_maps.permute(2, 0, 3, 1, 4).contiguous()  # (C, num_h, h, num_w, w)
-        full_density_map = patch_density_maps.view(C, num_h * h, num_w * w)[0]  # (H, W)
-        # Crop to original padded image size
+        patch_density_maps = patch_density_maps.permute(2, 0, 3, 1, 4).contiguous()
+        full_density_map = patch_density_maps.view(C, num_h * h, num_w * w)[0]
         full_density_map = full_density_map[:H, :W]
         real_density_map = full_density_map.cpu().numpy()
     else:
@@ -194,33 +197,115 @@ def infer_and_save_single_image(model):
         raise RuntimeError(f"Unexpected output type: {type(out_dict)}")
 
     out_logits, out_point = out_dict["pred_logits"], out_dict["pred_points"]
+    
+    print(f"out_logits: {out_logits.shape}")
+    print(f"out_point: {out_point.shape}")
+    print(f"DEBUG: out_logits min/max = {out_logits.min():.4f}/{out_logits.max():.4f}")
 
+    # ========== MATCH TEST.PY EXACTLY ==========
     prob = out_logits.sigmoid()
-    topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_queries, dim=1)
-
-    topk_points = topk_indexes // out_logits.shape[2]
-    out_point = torch.gather(out_point, 1, topk_points.unsqueeze(-1).repeat(1, 1, 2))
-    out_point = out_point * crop_size
-
-    value_points = torch.cat([topk_values.unsqueeze(2), out_point], 2)
-
-    point_map, density_map, drawn, count = show_map(
-        value_points, img_pad.copy(), W, H, crop_size, num_h, num_w, threshold=threshold
+    prob = prob.view(1, -1, 2)  # [1, num_patches*num_queries, 2]
+    out_logits_reshaped = out_logits.view(1, -1, 2)
+    
+    topk_k = num_patches * num_queries
+    
+    topk_values, topk_indexes = torch.topk(
+        prob.view(out_logits_reshaped.shape[0], -1),  # [1, 56000]
+        topk_k,
+        dim=1
     )
+    
+    print(f"topk_values shape: {topk_values.shape}")
+    print(f"topk_k: {topk_k}")
+    print(f"DEBUG: topk_values min/max = {topk_values.min():.4f}/{topk_values.max():.4f}")
+    print(f"Predictions above threshold: {(topk_values > threshold).sum().item()}")
+    
+    # Match test.py counting logic
+    count = 0
+    for k in range(topk_values.shape[0]):
+        sub_count = topk_values[k, :]
+        sub_count = sub_count.clone()
+        sub_count[sub_count < threshold] = 0
+        sub_count[sub_count > 0] = 1
+        sub_count = torch.sum(sub_count).item()
+        count += sub_count
+    
+    print(f"\nFinal count from logits: {count}")
+    
+    # If dm_count is enabled
+    if args.dm_count and isinstance(outputs, list) and len(outputs) == 2:
+        count_dm = 0
+        for k in range(out_dm[1].shape[0]):
+            count_dm += out_dm[1][k,:].sum().item()
+        print(f"Count from density map: {count_dm}")
+        print(f"Average: {(count + count_dm) / 2}")
+    
+    # ========== VISUALIZATION MATCHING TEST.PY ==========
+    # For visualization, we need to properly map points to patches
+    # The topk_indexes are from flattened [batch, num_patches*num_queries*2]
+    # We need to map back to [patch_idx, query_idx]
+    
+    # topk_indexes is in range [0, 56000) for 40 patches * 700 queries * 2 classes
+    # Each query has 2 class predictions, so:
+    # index = patch_idx * num_queries * 2 + query_idx * 2 + class_idx
+    
+    topk_points_idx = topk_indexes // 2  # Which query (ignoring class)
+    topk_class = topk_indexes % 2        # Which class (0 or 1)
+    
+    # Now map to actual points
+    # out_point shape: [num_patches, num_queries, 3] where 3 = [x, y, ?]
+    # We need the first 2 dimensions [x, y]
+    out_point_xy = out_point[:, :, :2]  # [num_patches, num_queries, 2]
+    
+    # Flatten to [num_patches * num_queries, 2]
+    out_point_flat = out_point_xy.reshape(-1, 2)
+    
+    # Select points based on topk indices
+    out_point_selected = out_point_flat[topk_points_idx[0]]  # [28000, 2]
+    out_point_selected = out_point_selected * crop_size  # Scale to pixel coordinates
+    
+    # Reconstruct for visualization - distribute to patches
+    value_points = torch.zeros(num_patches, num_queries, 3).cuda()
+    
+    for i in range(topk_k):
+        if topk_values[0, i] < threshold:
+            continue
+        
+        # Map flat index back to patch and query
+        flat_idx = topk_points_idx[0, i].item()
+        patch_idx = flat_idx // num_queries
+        query_idx = flat_idx % num_queries
+        
+        if patch_idx < num_patches and query_idx < num_queries:
+            value_points[patch_idx, query_idx, 0] = topk_values[0, i]
+            value_points[patch_idx, query_idx, 1:] = out_point_selected[i]
+    
+    value_points = value_points.unsqueeze(1)  # [num_patches, 1, num_queries, 3]
+    # ========== END MATCHING LOGIC ==========
 
-    # annotate
+    # Convert padded PIL image to BGR numpy for visualization
+    img_padded_np = np.array(img_pil_padded)
+    img_padded_bgr = cv2.cvtColor(img_padded_np, cv2.COLOR_RGB2BGR)
+    
+    point_map, density_map, drawn, count_visual = show_map(
+        value_points, img_padded_bgr.copy(), W, H, crop_size, num_h, num_w, threshold=threshold
+    )
+    
+    print(f"Count from visualization: {count_visual}\n")
+
+    # Annotate
     drawn_vis = drawn.copy()
-    cv2.putText(drawn_vis, f"Count: {count}", (30, 60),
+    cv2.putText(drawn_vis, f"Count: {int(count)}", (30, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
 
-    # crop back to original size if padded
+    # Crop back to original size if padded
+    ow, oh = img_pil.size
     if pad_h > 0 or pad_w > 0:
-        oh, ow = img_bgr.shape[:2]
         drawn_vis = drawn_vis[:oh, :ow]
         point_map = point_map[:oh, :ow]
         density_map = density_map[:oh, :ow]
         if real_density_map is not None:
-            real_density_map = real_density_map[..., :oh, :ow]
+            real_density_map = real_density_map[:oh, :ow]
 
     out_points_path = os.path.join(out_dir, f"{base}_pred_points.png")
     out_pointmap_path = os.path.join(out_dir, f"{base}_point_map.png")
@@ -230,25 +315,24 @@ def infer_and_save_single_image(model):
     cv2.imwrite(out_pointmap_path, point_map)
     cv2.imwrite(out_density_path, density_map)
 
-    # Save real density map from model if available
+    # Save real density map
     if real_density_map is not None:
         dm = real_density_map
-        # Resize to original image size if needed
-        if dm.shape[0] != img_bgr.shape[0] or dm.shape[1] != img_bgr.shape[1]:
-            dm = cv2.resize(dm, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
+        if dm.shape[0] != oh or dm.shape[1] != ow:
+            dm = cv2.resize(dm, (ow, oh), interpolation=cv2.INTER_CUBIC)
         if np.max(dm) > 0:
             dm = dm / np.max(dm) * 255
         dm = dm.astype(np.uint8)
         dm_color = cv2.applyColorMap(dm, 2)
         out_real_density_path = os.path.join(out_dir, f"{base}_real_density_map.png")
         cv2.imwrite(out_real_density_path, dm_color)
-        print(" ", out_real_density_path)
+        print("  ", out_real_density_path)
 
     print("Saved:")
-    print(" ", out_points_path)
-    print(" ", out_pointmap_path)
-    print(" ", out_density_path)
-    print("Predicted count:", count)
+    print("  ", out_points_path)
+    print("  ", out_pointmap_path)
+    print("  ", out_density_path)
+    print(f"Predicted count: {int(count)}")
 
 
 def main():

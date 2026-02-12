@@ -9,56 +9,53 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 from scipy.ndimage import gaussian_filter
+from PIL import Image
 
 import util.misc as utils
 from config import return_args, args
 from Networks.CDETR import build_model
 
-# Keep consistent with demo_video.py
-img_transform = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-to_tensor = transforms.ToTensor()
 
-
-def pad_to_multiple(img_bgr: np.ndarray, multiple: int):
+def pad_to_multiple_pil(img_pil: Image.Image, multiple: int):
     """Pad bottom/right so H,W are multiples of `multiple`."""
-    h, w = img_bgr.shape[:2]
-    pad_h = (multiple - (h % multiple)) % multiple
+    w, h = img_pil.size
     pad_w = (multiple - (w % multiple)) % multiple
+    pad_h = (multiple - (h % multiple)) % multiple
 
     if pad_h == 0 and pad_w == 0:
-        return img_bgr, (0, 0)
+        return img_pil, (0, 0)
 
-    padded = cv2.copyMakeBorder(
-        img_bgr, 0, pad_h, 0, pad_w,
-        borderType=cv2.BORDER_CONSTANT,
-        value=(0, 0, 0)
-    )
+    # Pad on right and bottom
+    new_w = w + pad_w
+    new_h = h + pad_h
+    padded = Image.new('RGB', (new_w, new_h), (0, 0, 0))
+    padded.paste(img_pil, (0, 0))
+    
     return padded, (pad_h, pad_w)
 
 
-def split_into_patches(img_bgr: np.ndarray, crop_size: int):
+def split_into_patches_pil(img_pil: Image.Image, crop_size: int, transform):
     """
-    Convert to tensor + normalize, then split into (N,3,crop,crop) patches.
-    Matches demo_video.py’s reshape logic.
+    Convert PIL image to patches, matching the dataloader's logic exactly.
     """
-    img_t = to_tensor(img_bgr)     # (3,H,W), float [0,1]
-    img_t = img_transform(img_t)
-
+    # Apply transform (ToTensor + Normalize) - same as dataloader
+    img_t = transform(img_pil)  # [3, H, W]
+    
     width, height = img_t.shape[2], img_t.shape[1]
     num_w = int(width / crop_size)
     num_h = int(height / crop_size)
-
+    
+    # Match dataset.py patch splitting logic exactly
     img_t = img_t.view(3, num_h, crop_size, width).view(3, num_h, crop_size, num_w, crop_size)
     img_t = img_t.permute(0, 1, 3, 2, 4).contiguous().view(3, num_w * num_h, crop_size, crop_size)
-    patches = img_t.permute(1, 0, 2, 3).contiguous()  # (N,3,crop,crop)
-
+    patches = img_t.permute(1, 0, 2, 3).contiguous()  # [N, 3, crop, crop]
+    
     return patches, num_h, num_w, height, width
 
 
 def show_map(out_pointes, frame_bgr, width, height, crop_size, num_h, num_w, threshold=0.25):
     """
-    Adapted from demo_video.py. Builds a stitched point map and draws points.
+    Builds a stitched point map and draws points.
     out_pointes: (Npatch, 1, Q, 3) with [conf, x, y] in patch coords.
     """
     kpoint_list = []
@@ -71,7 +68,7 @@ def show_map(out_pointes, frame_bgr, width, height, crop_size, num_h, num_w, thr
 
         for j in range(len(out_point)):
             if out_value[j] < threshold:
-                break
+                continue
             x = int(out_point[j][0])
             y = int(out_point[j][1])
             if 0 <= x < crop_size and 0 <= y < crop_size:
@@ -106,7 +103,7 @@ def show_map(out_pointes, frame_bgr, width, height, crop_size, num_h, num_w, thr
         w = int(pred_coor[1][i])
         h = int(pred_coor[0][i])
         cv2.circle(point_map, (w, h), 3, (0, 0, 0), -1)
-        cv2.circle(frame_drawn, (w, h), 3, (0, 255, 50), -1)
+        cv2.circle(frame_drawn, (w, h), 3, (0, 0, 255), -1)
 
     return point_map, density_map, frame_drawn, count
 
@@ -116,8 +113,6 @@ def build_and_load_model():
     model, criterion, postprocessors = build_model(return_args)
     model = model.cuda()
 
-    # Use your gpu_id string style (e.g., "0,1"), but for single inference we typically use first GPU
-    # DataParallel expects list of ints
     gpu_ids = [int(x) for x in str(args.gpu_id).split(",") if x.strip() != ""]
     if len(gpu_ids) == 0:
         gpu_ids = [0]
@@ -172,6 +167,13 @@ def infer_and_save_video(model):
     threshold = float(args.threshold)
     num_queries = int(args.num_queries)
 
+    # Create transform matching the dataloader
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+
     frame_idx = 0
     total_count = 0
 
@@ -180,9 +182,18 @@ def infer_and_save_video(model):
         if not ret:
             break
 
-        img_pad, (pad_h, pad_w) = pad_to_multiple(img_bgr, crop_size)
-        patches, num_h, num_w, H, W = split_into_patches(img_pad, crop_size)
+        # Convert BGR to RGB and create PIL Image (matching dataloader)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+
+        # Pad to multiple of crop_size
+        img_pil_padded, (pad_h, pad_w) = pad_to_multiple_pil(img_pil, crop_size)
+        
+        # Split into patches
+        patches, num_h, num_w, H, W = split_into_patches_pil(img_pil_padded, crop_size, transform)
         patches = patches.cuda()
+
+        num_patches = patches.shape[0]
 
         outputs = model(patches)
         if isinstance(outputs, list):
@@ -192,26 +203,69 @@ def infer_and_save_video(model):
 
         out_logits, out_point = outputs["pred_logits"], outputs["pred_points"]
 
+        # ========== MATCH TEST.PY COUNTING LOGIC ==========
         prob = out_logits.sigmoid()
-        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_queries, dim=1)
+        prob = prob.view(1, -1, 2)
+        out_logits_reshaped = out_logits.view(1, -1, 2)
+        
+        topk_k = num_patches * num_queries
+        topk_values, topk_indexes = torch.topk(
+            prob.view(out_logits_reshaped.shape[0], -1),
+            topk_k,
+            dim=1
+        )
+        
+        # Count predictions above threshold
+        count = 0
+        for k in range(topk_values.shape[0]):
+            sub_count = topk_values[k, :]
+            sub_count = sub_count.clone()
+            sub_count[sub_count < threshold] = 0
+            sub_count[sub_count > 0] = 1
+            count += torch.sum(sub_count).item()
+        
+        # For visualization - map points back to patches
+        topk_points_idx = topk_indexes // 2
+        
+        # Extract x,y coordinates only
+        out_point_xy = out_point[:, :, :2]
+        out_point_flat = out_point_xy.reshape(-1, 2)
+        out_point_selected = out_point_flat[topk_points_idx[0]]
+        out_point_selected = out_point_selected * crop_size
+        
+        # Reconstruct for visualization
+        value_points = torch.zeros(num_patches, num_queries, 3).cuda()
+        
+        for i in range(topk_k):
+            if topk_values[0, i] < threshold:
+                continue
+            
+            flat_idx = topk_points_idx[0, i].item()
+            patch_idx = flat_idx // num_queries
+            query_idx = flat_idx % num_queries
+            
+            if patch_idx < num_patches and query_idx < num_queries:
+                value_points[patch_idx, query_idx, 0] = topk_values[0, i]
+                value_points[patch_idx, query_idx, 1:] = out_point_selected[i]
+        
+        value_points = value_points.unsqueeze(1)
+        # ========== END MATCHING LOGIC ==========
 
-        topk_points = topk_indexes // out_logits.shape[2]
-        out_point = torch.gather(out_point, 1, topk_points.unsqueeze(-1).repeat(1, 1, 2))
-        out_point = out_point * crop_size
+        # Convert padded PIL image back to BGR for visualization
+        img_padded_np = np.array(img_pil_padded)
+        img_padded_bgr = cv2.cvtColor(img_padded_np, cv2.COLOR_RGB2BGR)
 
-        value_points = torch.cat([topk_values.unsqueeze(2), out_point], 2)
-
-        point_map, density_map, drawn, count = show_map(
-            value_points, img_pad.copy(), W, H, crop_size, num_h, num_w, threshold=threshold
+        point_map, density_map, drawn, count_visual = show_map(
+            value_points, img_padded_bgr.copy(), W, H, crop_size, num_h, num_w, threshold=threshold
         )
 
         drawn_vis = drawn.copy()
-        cv2.putText(drawn_vis, f"Count: {count}", (30, 60),
+        cv2.putText(drawn_vis, f"Count: {int(count)}", (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
 
-        # crop back to original size if padded
+        # Crop back to original size if padded
         if pad_h > 0 or pad_w > 0:
-            oh, ow = img_bgr.shape[:2]
+            oh, ow = height, width
             drawn_vis = drawn_vis[:oh, :ow]
 
         out_video.write(drawn_vis)
@@ -219,12 +273,12 @@ def infer_and_save_video(model):
         frame_idx += 1
 
         if frame_idx % 10 == 0:
-            print(f"Processed {frame_idx} frames...")
+            print(f"Processed {frame_idx} frames... (last count: {int(count)})")
 
     cap.release()
     out_video.release()
     print(f"Saved output video: {output_video_path}")
-    print(f"Processed {frame_idx} frames. Total predicted count (sum over frames): {total_count}")
+    print(f"Processed {frame_idx} frames. Total predicted count (sum over frames): {int(total_count)}")
 
 
 def main():
