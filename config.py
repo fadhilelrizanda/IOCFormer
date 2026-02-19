@@ -65,6 +65,17 @@ parser.add_argument('--test_per_epoch', type=int, default=20,
 parser.add_argument('--threshold', type=float, default=0.35,
                     help='threshold to filter the negative points')
 
+# Grid/mask visualization for demo scripts
+parser.add_argument('--grid_rows', type=int, default=8,
+                    help='number of grid rows for masked output')
+parser.add_argument('--grid_cols', type=int, default=8,
+                    help='number of grid columns for masked output')
+parser.add_argument('--dense_thr', type=float, default=2.0,
+                    help='density sum threshold per cell to consider it dense')
+parser.add_argument('--mask_mode', type=str, default='blur',
+                    choices=['blur', 'mean', 'black'],
+                    help='how to mask dense cells in the grid (blur/mean/black)')
+
 # video demo
 parser.add_argument('--video_path', type=str, default='./video_demo/1.mp4',
                     help='input video path ')
